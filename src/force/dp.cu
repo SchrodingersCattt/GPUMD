@@ -479,200 +479,77 @@ void DP::compute(
 {
   const int number_of_atoms = type.size();
   if (number_of_atoms <= 0) return;
-  dp_nl.inum = number_of_atoms;
   int grid_size = (number_of_atoms - 1) / BLOCK_SIZE_FORCE + 1;
-  int num_bins_unused[3];
-  box.get_num_bins(rc, num_bins_unused);
-  const int max_ghost_num_each_danger = get_max_ghost_num_each_danger(box, rc);
 
-  // get ghost atom number
-nghost = calc_ghost_atom_number(
-  BLOCK_SIZE_FORCE,
-  grid_size,
-  number_of_atoms,
-  rc,
-  position_per_atom.data(),
-  ghost_count.data(),
-  danger_flag.data(),
-  box);
+  // ---- No-nlist path (nlist-free DeePMD API) ----
+  // Use the overload that takes only nlocal coordinates + original box (with PBC).
+  // DeePMD internally extends coordinates and builds its own neighbor list.
+  // This avoids the ZBL shape-constraint crash where nall = nlocal + nghost
+  // varies between MD steps in AOTInductor-compiled .pt2 models.
 
-  thrust::exclusive_scan(
-    thrust::device, ghost_count.data(), ghost_count.data() + number_of_atoms, ghost_sum.data());
-  thrust::exclusive_scan(
-    thrust::device, danger_flag.data(), danger_flag.data() + number_of_atoms, danger_list.data());
-
-  ndanger = thrust::reduce(
-    thrust::device,
-    danger_flag.data(),
-    danger_flag.data() + number_of_atoms,
-    0,
-    thrust::plus<int>());
-
-  // check_ghost<<<grid_size, BLOCK_SIZE_FORCE>>>(ghost_count.data(), ghost_sum.data(), ghost_flag.data(), ghost_list.data(), number_of_atoms);
-  // resize the ghost vectors
-  int num_all_atoms = number_of_atoms + nghost; // all atoms include ghost atoms
-  int grid_size_ghost = (num_all_atoms - 1) / BLOCK_SIZE_FORCE + 1;
-
-  // Prevent ndanger == 0 from causing an error.
-  if ( ndanger == 0 ) ghost_id_map.resize(1, -1);
-  else ghost_id_map.resize(ndanger * max_ghost_num_each_danger, -1);
-
-  type_ghost.resize(num_all_atoms);
-  dp_position_gpu.resize(num_all_atoms * 3);
-  
-  create_ghost_map<<<grid_size, BLOCK_SIZE_FORCE>>>(
-    number_of_atoms,
-    nghost,
-    ndanger,
-    rc,
-    ghost_count.data(),
-    ghost_sum.data(),
-    danger_list.data(),
-    ghost_id_map.data(),
-    type_ghost.data(),
-    type.data(),
+  // 1. Transpose nlocal positions from SoA (GPU) to AoS (CPU)
+  dp_position_gpu_trans.resize(number_of_atoms * 3);
+  dp_position_transpose<<<grid_size, BLOCK_SIZE_FORCE>>>(
     position_per_atom.data(),
-    position_per_atom.data() + number_of_atoms,
-    position_per_atom.data() + number_of_atoms * 2,
-    dp_position_gpu.data(),
-    box,
-    max_ghost_num_each_danger);
-  GPU_CHECK_KERNEL
-
-  dp_data.NN.resize(num_all_atoms);
-  dp_data.NL.resize(num_all_atoms * MAX_NEIGH_NUM_DP);
-  dp_data.cell_contents.resize(num_all_atoms);
-  dp_data.cell_count.resize(num_all_atoms);
-  dp_data.cell_count_sum.resize(num_all_atoms);
-
-  Box box_ghost;
-  create_dp_ghost_box(box, rc, box_ghost);
-
-  find_neighbor(
-    N1,
-    num_all_atoms,
-    rc,
-    box_ghost,
-    type_ghost,
-    dp_position_gpu,
-    dp_data.cell_count,
-    dp_data.cell_count_sum,
-    dp_data.cell_contents,
-    dp_data.NN,
-    dp_data.NL);
-
-  // Initialize DeepPot computation variables
-  dp_ene_all.resize(1, 0.0);
-  dp_ene_atom.resize(num_all_atoms, 0.0);
-  dp_force.resize(num_all_atoms * 3, 0.0);
-  dp_vir_all.resize(9, 0.0);
-  dp_vir_atom.resize(num_all_atoms * 9, 0.0);
-
-  // copy position and type to CPU
-  dp_position_gpu_trans.resize(num_all_atoms * 3);
-  dp_position_transpose<<<grid_size_ghost, BLOCK_SIZE_FORCE>>>(
-    dp_position_gpu.data(),
     dp_position_gpu_trans.data(),
-    num_all_atoms);
+    number_of_atoms);
   GPU_CHECK_KERNEL
-  dp_position_cpu.resize(num_all_atoms * 3);
+
+  dp_position_cpu.resize(number_of_atoms * 3);
   dp_position_gpu_trans.copy_to_host(dp_position_cpu.data());
-  type_cpu.resize(num_all_atoms);
-  type_ghost.copy_to_host(type_cpu.data());
 
-  // create dp box
+  // 2. Copy types to CPU
+  type_cpu.resize(number_of_atoms);
+  type.copy_to_host(type_cpu.data());
+
+  // 3. Set the ORIGINAL box (with PBC) for DeePMD
   std::vector<double> dp_box(9, 0.0);
-  set_deepmd_box(box_ghost, dp_box);
+  set_deepmd_box(box, dp_box);
 
-  dp_nl.ilist.resize(num_all_atoms, 0);
-  dp_nl.numneigh.resize(num_all_atoms, 0);
-  dp_nl.firstneigh.resize(num_all_atoms, nullptr);
+  // 4. Initialize DeepPot computation output vectors (nlocal only)
+  dp_ene_all.assign(1, 0.0);
+  dp_ene_atom.assign(number_of_atoms, 0.0);
+  dp_force.assign(number_of_atoms * 3, 0.0);
+  dp_vir_all.assign(9, 0.0);
+  dp_vir_atom.assign(number_of_atoms * 9, 0.0);
 
-  // Allocate lmp_ilist and lmp_numneigh
-  dp_data.NN.copy_to_host(dp_nl.numneigh.data());
-  int max_numneigh = 0;
-  for (int i = 0; i < num_all_atoms; ++i) {
-    if (dp_nl.numneigh[i] > max_numneigh) max_numneigh = dp_nl.numneigh[i];
-  }
-  if (max_numneigh > MAX_NEIGH_NUM_DP) {
-    printf("Error: DP neighbor overflow. max_numneigh = %d, limit = %d\n", max_numneigh, MAX_NEIGH_NUM_DP);
-    exit(1);
-  }
-  cpu_NL.resize(dp_data.NL.size());
-  dp_data.NL.copy_to_host(cpu_NL.data());
-
-  int offset = 0;
-  dp_nl.neigh_storage.resize(dp_data.NL.size());
-  for (int i = 0; i < num_all_atoms; ++i) {
-    dp_nl.ilist[i] = i;
-    dp_nl.firstneigh[i] = dp_nl.neigh_storage.data() + offset;
-    for (int j = 0; j < dp_nl.numneigh[i]; ++j) {
-        dp_nl.neigh_storage[offset + j] = cpu_NL[i + j * num_all_atoms]; // Copy in column-major order
-    }
-    offset += dp_nl.numneigh[i];
+  // 5. Call DeePMD no-nlist API: DeePMD handles ghost extension internally
+  if (single_model && !atom_spin_flag) {
+    deep_pot.compute(dp_ene_all, dp_force, dp_vir_all, dp_ene_atom, dp_vir_atom,
+                     dp_position_cpu, type_cpu, dp_box);
   }
 
-  // Constructing a neighbor list in LAMMPS format
-  // inum: number of local atoms
-  // the neighbor list record the message of ghost atoms, so len(numneigh) = nlocal + nghost 
-  // deepmd_compat::InputNlist lmp_list(nlocal, lmp_ilist, lmp_numneigh, lmp_firstneigh);
-  deepmd_compat::InputNlist lmp_list(dp_nl.inum, dp_nl.ilist.data(), dp_nl.numneigh.data(), dp_nl.firstneigh.data());
-
-  // Map each local and ghost atom to its corresponding local atom for DeePMD-kit.
-  // Keep atom_mapping alive until deep_pot.compute() has used lmp_list.
-  std::vector<int> atom_mapping(num_all_atoms);
-  for (int i = 0; i < number_of_atoms; ++i) atom_mapping[i] = i;
-  if (nghost > 0) {
-    std::vector<int> gc(number_of_atoms), gs(number_of_atoms);
-    ghost_count.copy_to_host(gc.data());
-    ghost_sum.copy_to_host(gs.data());
-    for (int i = 0; i < number_of_atoms; ++i)
-      for (int g = 0; g < gc[i]; ++g)
-        atom_mapping[number_of_atoms + gs[i] + g] = i;
-  }
-  lmp_list.set_mapping(atom_mapping.data());
-
-
-  // to calculate the atomic force and energy from deepot
-  if (single_model) {
-    if (! atom_spin_flag) {
-        deep_pot.compute(dp_ene_all, dp_force, dp_vir_all, dp_ene_atom, dp_vir_atom, 
-            dp_position_cpu, type_cpu, dp_box,
-            nghost, lmp_list, 0);
-    }
-  }
-
-  // copy dp output energy, force, and virial to gpu
-  // memory distribution of e_f_v_gpu: e1, e2 ... en, fx1, fy1, fz1, fx2 ... fzn, vxx1 ...
+  // 6. Copy dp output energy, force, and virial to GPU
+  // memory layout of e_f_v_gpu: e1..en, fx1,fy1,fz1..fxn,fyn,fzn, vxx1..vzz_n
+  e_f_v_gpu.resize(number_of_atoms * (1 + 3 + 9));
   e_f_v_gpu.copy_from_host(dp_ene_atom.data(), number_of_atoms, 0);
   e_f_v_gpu.copy_from_host(dp_force.data(), number_of_atoms * 3, number_of_atoms);
   e_f_v_gpu.copy_from_host(dp_vir_atom.data(), number_of_atoms * 9, number_of_atoms * 4);
-  
-  // copy ghost atom force and virial to modify the local atoms' force and virial
-  if (nghost > 0) {
-    f_ghost.resize(nghost * 3);
-    v_ghost.resize(nghost * 9);
-    f_ghost.copy_from_host(dp_force.data() + number_of_atoms * 3, nghost * 3);
-    v_ghost.copy_from_host(dp_vir_atom.data() + number_of_atoms * 9, nghost * 9);
-  }
 
-  // transpose dp vectors
+  // 7. Transpose and apply unit conversion (no ghost back-mapping needed)
+  //    ndanger=0, nghost=0: the kernel skips the ghost force accumulation branch.
+  danger_list.resize(number_of_atoms);
+  GPU_Vector<int> dummy_ghost_id_map(1, -1);
+  // Fill danger_list with -1 so the kernel never enters the ghost branch
+  std::vector<int> neg_ones(number_of_atoms, -1);
+  danger_list.copy_from_host(neg_ones.data());
+
   transpose_and_update_unit<<<grid_size, BLOCK_SIZE_FORCE>>>(
     e_f_v_gpu.data(),
     potential_per_atom.data(),
     force_per_atom.data(),
     virial_per_atom.data(),
-    f_ghost.data(),
-    v_ghost.data(),
+    nullptr,   // f_ghost (unused — nghost == 0)
+    nullptr,   // v_ghost (unused — nghost == 0)
     danger_list.data(),
-    ghost_id_map.data(),
+    dummy_ghost_id_map.data(),
     ener_unit_cvt_factor,
     force_unit_cvt_factor,
     virial_unit_cvt_factor,
     number_of_atoms,
-    ndanger,
-    nghost,
-    max_ghost_num_each_danger);
+    0,    // ndanger
+    0,    // nghost
+    0);   // max_ghost_num_each_danger
   GPU_CHECK_KERNEL
 }
 #endif
