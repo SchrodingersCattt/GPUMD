@@ -28,17 +28,61 @@ The class dealing with the Deep Potential(DP).
 #include <cmath>
 #include <sstream>
 #include <cstring>
+#include <fstream>
 
 #define BLOCK_SIZE_FORCE 128
 #define MAX_NEIGH_NUM_DP 512    // max neighbor number of an atom for DP
 
-DP::DP(const char* filename_dp, int num_atoms)
+DP::DP(const char* setting_file, const char* filename_dp, int num_atoms)
 {
   // DP setting
   set_dp_coeff();
 
   // init DP from potential file
   initialize_dp(filename_dp);
+
+  // Build type remapping table from setting file's element order → model type indices.
+  // The setting file format: "dp <num_types> <elem1> <elem2> ..."
+  // GPUMD assigns type 0 to elem1, type 1 to elem2, etc.
+  // The model type_map has its own indexing (e.g. universal models: H=0, He=1, ..., O=7, ...)
+  // We must remap GPUMD's local type i → model type index for DeePMD compute().
+  {
+    std::ifstream ifs(setting_file);
+    if (ifs.is_open()) {
+      std::string line;
+      std::getline(ifs, line);
+      std::istringstream iss_line(line);
+      std::string pot_name;
+      int num_user_types;
+      iss_line >> pot_name >> num_user_types;
+      type_remap.resize(num_user_types, -1);
+      for (int t = 0; t < num_user_types; ++t) {
+        std::string elem;
+        iss_line >> elem;
+        // Find this element in the model's type_map
+        for (int m = 0; m < (int)model_type_map.size(); ++m) {
+          if (model_type_map[m] == elem) {
+            type_remap[t] = m;
+            break;
+          }
+        }
+        if (type_remap[t] < 0) {
+          printf("ERROR: Element '%s' from dp_setting not found in model type_map!\n",
+                 elem.c_str());
+          exit(1);
+        }
+      }
+      ifs.close();
+      printf("  Type remapping (GPUMD local → model index):\n");
+      for (int t = 0; t < num_user_types; ++t) {
+        printf("    local type %d → model type %d\n", t, type_remap[t]);
+      }
+      printf("---------------------------------------------------------------\n");
+    } else {
+      printf("WARNING: Cannot open setting file '%s' for type remapping.\n", setting_file);
+      printf("  Assuming identity mapping (local type i = model type i).\n");
+    }
+  }
 
 
   dp_data.NN.resize(num_atoms);
@@ -75,17 +119,15 @@ void DP::initialize_dp(const char* filename_dp)
   int dim_fparam = deep_pot.dim_fparam();
   int dim_aparam = deep_pot.dim_aparam();
 
-  char* type_map[numb_types];
+  // Store the model's type map for later remapping
   std::string type_map_str;
   deep_pot.get_type_map(type_map_str);
-  // convert the string to a vector of strings
   std::istringstream iss(type_map_str);
   std::string type_name;
-  int i = 0;
+  model_type_map.clear();
   while (iss >> type_name) {
-    if (i >= numb_types) break;
-    type_map[i] = strdup(type_name.c_str());
-    i++;
+    if ((int)model_type_map.size() >= numb_types) break;
+    model_type_map.push_back(type_name);
   }
 
   printf("---------------------------------------------------------------\n");
@@ -94,9 +136,9 @@ void DP::initialize_dp(const char* filename_dp)
   printf("  ++ numb_types_spin: %d ++ \n", numb_types_spin);
   printf("  ++ dim_fparam: %d ++ \n", dim_fparam);
   printf("  ++ dim_aparam: %d ++ \n  ++ ", dim_aparam);
-  for (int i = 0; i < numb_types; ++i)
+  for (int i = 0; i < (int)model_type_map.size(); ++i)
   {
-    printf("%s ", type_map[i]);
+    printf("%s ", model_type_map[i].c_str());
   }
   printf("++\n---------------------------------------------------------------\n");
 }
@@ -553,6 +595,17 @@ void DP::compute(
     // Copy types to CPU (type is const, so use gpuMemcpy directly)
     type_cpu.resize(number_of_atoms);
     CHECK(gpuMemcpy(type_cpu.data(), type.data(), sizeof(int) * number_of_atoms, gpuMemcpyDeviceToHost));
+
+    // Remap GPUMD local type indices to model type indices.
+    // GPUMD assigns type 0,1,2,... based on element order in dp_setting.
+    // Universal models may have 118 types (full periodic table), so local type 1
+    // might correspond to model type 7 (e.g. O). Without remapping, the model
+    // receives wrong element identities and produces catastrophically wrong forces.
+    if (!type_remap.empty()) {
+      for (int i = 0; i < number_of_atoms; ++i) {
+        type_cpu[i] = type_remap[type_cpu[i]];
+      }
+    }
 
     // Build the box for DeePMD, handling non-periodic directions.
     // For non-periodic directions, inflate box vectors so that the effective
