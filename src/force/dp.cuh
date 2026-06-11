@@ -53,7 +53,7 @@ class DP : public Potential
 {
 public:
   using Potential::compute;
-  DP(const char* , int);
+  DP(const char* setting_file, const char* model_file, int num_atoms);
   virtual ~DP(void);
   virtual void compute(
     Box& box,
@@ -154,5 +154,12 @@ protected:
 
   void set_dp_coeff();
   void release_pinned_host_buffers();
+
+  // Type remapping: GPUMD local type index → model type index
+  // GPUMD assigns types 0,1,2,... based on element order in dp_setting file.
+  // Universal models have 118 types (full periodic table). This vector maps
+  // local index i → model index that the DeePMD compute() API expects.
+  std::vector<int> type_remap;
+  std::vector<std::string> model_type_map;  // stored from model initialization
 };
 #endif

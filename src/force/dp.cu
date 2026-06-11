@@ -28,17 +28,61 @@ The class dealing with the Deep Potential(DP).
 #include <cmath>
 #include <sstream>
 #include <cstring>
+#include <fstream>
 
 #define BLOCK_SIZE_FORCE 128
 #define MAX_NEIGH_NUM_DP 512    // max neighbor number of an atom for DP
 
-DP::DP(const char* filename_dp, int num_atoms)
+DP::DP(const char* setting_file, const char* filename_dp, int num_atoms)
 {
   // DP setting
   set_dp_coeff();
 
   // init DP from potential file
   initialize_dp(filename_dp);
+
+  // Build type remapping table from setting file's element order → model type indices.
+  // The setting file format: "dp <num_types> <elem1> <elem2> ..."
+  // GPUMD assigns type 0 to elem1, type 1 to elem2, etc.
+  // The model type_map has its own indexing (e.g. universal models: H=0, He=1, ..., O=7, ...)
+  // We must remap GPUMD's local type i → model type index for DeePMD compute().
+  {
+    std::ifstream ifs(setting_file);
+    if (ifs.is_open()) {
+      std::string line;
+      std::getline(ifs, line);
+      std::istringstream iss_line(line);
+      std::string pot_name;
+      int num_user_types;
+      iss_line >> pot_name >> num_user_types;
+      type_remap.resize(num_user_types, -1);
+      for (int t = 0; t < num_user_types; ++t) {
+        std::string elem;
+        iss_line >> elem;
+        // Find this element in the model's type_map
+        for (int m = 0; m < (int)model_type_map.size(); ++m) {
+          if (model_type_map[m] == elem) {
+            type_remap[t] = m;
+            break;
+          }
+        }
+        if (type_remap[t] < 0) {
+          printf("ERROR: Element '%s' from dp_setting not found in model type_map!\n",
+                 elem.c_str());
+          exit(1);
+        }
+      }
+      ifs.close();
+      printf("  Type remapping (GPUMD local → model index):\n");
+      for (int t = 0; t < num_user_types; ++t) {
+        printf("    local type %d → model type %d\n", t, type_remap[t]);
+      }
+      printf("---------------------------------------------------------------\n");
+    } else {
+      printf("WARNING: Cannot open setting file '%s' for type remapping.\n", setting_file);
+      printf("  Assuming identity mapping (local type i = model type i).\n");
+    }
+  }
 
 
   dp_data.NN.resize(num_atoms);
@@ -75,17 +119,15 @@ void DP::initialize_dp(const char* filename_dp)
   int dim_fparam = deep_pot.dim_fparam();
   int dim_aparam = deep_pot.dim_aparam();
 
-  char* type_map[numb_types];
+  // Store the model's type map for later remapping
   std::string type_map_str;
   deep_pot.get_type_map(type_map_str);
-  // convert the string to a vector of strings
   std::istringstream iss(type_map_str);
   std::string type_name;
-  int i = 0;
+  model_type_map.clear();
   while (iss >> type_name) {
-    if (i >= numb_types) break;
-    type_map[i] = strdup(type_name.c_str());
-    i++;
+    if ((int)model_type_map.size() >= numb_types) break;
+    model_type_map.push_back(type_name);
   }
 
   printf("---------------------------------------------------------------\n");
@@ -94,9 +136,9 @@ void DP::initialize_dp(const char* filename_dp)
   printf("  ++ numb_types_spin: %d ++ \n", numb_types_spin);
   printf("  ++ dim_fparam: %d ++ \n", dim_fparam);
   printf("  ++ dim_aparam: %d ++ \n  ++ ", dim_aparam);
-  for (int i = 0; i < numb_types; ++i)
+  for (int i = 0; i < (int)model_type_map.size(); ++i)
   {
-    printf("%s ", type_map[i]);
+    printf("%s ", model_type_map[i].c_str());
   }
   printf("++\n---------------------------------------------------------------\n");
 }
@@ -554,6 +596,17 @@ void DP::compute(
     type_cpu.resize(number_of_atoms);
     CHECK(gpuMemcpy(type_cpu.data(), type.data(), sizeof(int) * number_of_atoms, gpuMemcpyDeviceToHost));
 
+    // Remap GPUMD local type indices to model type indices.
+    // GPUMD assigns type 0,1,2,... based on element order in dp_setting.
+    // Universal models may have 118 types (full periodic table), so local type 1
+    // might correspond to model type 7 (e.g. O). Without remapping, the model
+    // receives wrong element identities and produces catastrophically wrong forces.
+    if (!type_remap.empty()) {
+      for (int i = 0; i < number_of_atoms; ++i) {
+        type_cpu[i] = type_remap[type_cpu[i]];
+      }
+    }
+
     // Build the box for DeePMD, handling non-periodic directions.
     // For non-periodic directions, inflate box vectors so that the effective
     // thickness in that direction >= atom_extent + 4*rc, preventing DeePMD
@@ -697,6 +750,34 @@ void DP::compute(
           dp_position_cpu[i * 3 + 1] = dp_h[3] * sx + dp_h[4] * sy + dp_h[5] * sz;
           dp_position_cpu[i * 3 + 2] = dp_h[6] * sx + dp_h[7] * sy + dp_h[8] * sz;
         }
+      }
+    }
+
+    // Wrap coordinates into the primary cell [0, 1) in fractional space.
+    // GPUMD does not wrap atomic positions during integration (it uses MIC only
+    // for distance calculations). DeePMD's C++ backend builds its internal
+    // neighbor list assuming atoms are within (or very close to) the simulation
+    // box. For triclinic cells, atoms far outside the box lead to incorrect
+    // neighbor construction and wrong forces. We wrap here before calling DeePMD.
+    // Note: for the non-periodic path above, coordinates are already properly
+    // centered; this wrapping applies to all fully-periodic directions.
+    {
+      // Use the inverse matrix (cpu_h[9..17]) to convert Cartesian → fractional
+      for (int i = 0; i < number_of_atoms; ++i) {
+        double x = dp_position_cpu[i * 3];
+        double y = dp_position_cpu[i * 3 + 1];
+        double z = dp_position_cpu[i * 3 + 2];
+        double sx = box.cpu_h[9]  * x + box.cpu_h[10] * y + box.cpu_h[11] * z;
+        double sy = box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z;
+        double sz = box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z;
+        // Wrap periodic directions to [0, 1)
+        if (box.pbc_x == 1) sx -= floor(sx);
+        if (box.pbc_y == 1) sy -= floor(sy);
+        if (box.pbc_z == 1) sz -= floor(sz);
+        // Convert back to Cartesian using the (possibly inflated) dp_h
+        dp_position_cpu[i * 3]     = dp_h[0] * sx + dp_h[1] * sy + dp_h[2] * sz;
+        dp_position_cpu[i * 3 + 1] = dp_h[3] * sx + dp_h[4] * sy + dp_h[5] * sz;
+        dp_position_cpu[i * 3 + 2] = dp_h[6] * sx + dp_h[7] * sy + dp_h[8] * sz;
       }
     }
 

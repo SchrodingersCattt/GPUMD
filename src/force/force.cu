@@ -168,7 +168,7 @@ void Force::parse_potential(
         "The potential command should contain two parameters, the setting file and the DP "
         "potential file name.\n");
     }
-    potential.reset(new DP(param[2], number_of_atoms));
+    potential.reset(new DP(param[1], param[2], number_of_atoms));
 #endif
 #ifdef USE_NNAP
   } else if (strcmp(potential_name, "nnap") == 0) {
