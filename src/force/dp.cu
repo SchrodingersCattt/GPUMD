@@ -700,6 +700,34 @@ void DP::compute(
       }
     }
 
+    // Wrap coordinates into the primary cell [0, 1) in fractional space.
+    // GPUMD does not wrap atomic positions during integration (it uses MIC only
+    // for distance calculations). DeePMD's C++ backend builds its internal
+    // neighbor list assuming atoms are within (or very close to) the simulation
+    // box. For triclinic cells, atoms far outside the box lead to incorrect
+    // neighbor construction and wrong forces. We wrap here before calling DeePMD.
+    // Note: for the non-periodic path above, coordinates are already properly
+    // centered; this wrapping applies to all fully-periodic directions.
+    {
+      // Use the inverse matrix (cpu_h[9..17]) to convert Cartesian → fractional
+      for (int i = 0; i < number_of_atoms; ++i) {
+        double x = dp_position_cpu[i * 3];
+        double y = dp_position_cpu[i * 3 + 1];
+        double z = dp_position_cpu[i * 3 + 2];
+        double sx = box.cpu_h[9]  * x + box.cpu_h[10] * y + box.cpu_h[11] * z;
+        double sy = box.cpu_h[12] * x + box.cpu_h[13] * y + box.cpu_h[14] * z;
+        double sz = box.cpu_h[15] * x + box.cpu_h[16] * y + box.cpu_h[17] * z;
+        // Wrap periodic directions to [0, 1)
+        if (box.pbc_x == 1) sx -= floor(sx);
+        if (box.pbc_y == 1) sy -= floor(sy);
+        if (box.pbc_z == 1) sz -= floor(sz);
+        // Convert back to Cartesian using the (possibly inflated) dp_h
+        dp_position_cpu[i * 3]     = dp_h[0] * sx + dp_h[1] * sy + dp_h[2] * sz;
+        dp_position_cpu[i * 3 + 1] = dp_h[3] * sx + dp_h[4] * sy + dp_h[5] * sz;
+        dp_position_cpu[i * 3 + 2] = dp_h[6] * sx + dp_h[7] * sy + dp_h[8] * sz;
+      }
+    }
+
     // Construct dp_box in DeePMD row-major format from (possibly inflated) dp_h
     // DeePMD box layout: row0=a, row1=b, row2=c (each as x,y,z)
     std::vector<double> dp_box(9, 0.0);
