@@ -28,9 +28,84 @@ The class dealing with the Deep Potential(DP).
 #include <cmath>
 #include <sstream>
 #include <cstring>
+#include <cstdlib>
+#include <chrono>
 
 #define BLOCK_SIZE_FORCE 128
 #define MAX_NEIGH_NUM_DP 512    // max neighbor number of an atom for DP
+
+namespace {
+struct DP_Profile_Record {
+  bool enabled = false;
+  long long calls = 0;
+  long long atoms_accum = 0;
+  double position_transpose_ms = 0.0;
+  double position_d2h_ms = 0.0;
+  double type_d2h_ms = 0.0;
+  double box_preprocess_ms = 0.0;
+  double output_resize_ms = 0.0;
+  double deepmd_compute_ms = 0.0;
+  double energy_h2d_ms = 0.0;
+  double force_h2d_ms = 0.0;
+  double virial_h2d_ms = 0.0;
+  double output_transpose_ms = 0.0;
+};
+
+static DP_Profile_Record dp_profile_record;
+
+static bool dp_profile_enabled()
+{
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char* value = std::getenv("GPUMD_DP_PROFILE");
+    enabled = (value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0) ? 1 : 0;
+    dp_profile_record.enabled = enabled == 1;
+  }
+  return enabled == 1;
+}
+
+static double dp_profile_elapsed_ms(
+  const std::chrono::steady_clock::time_point& begin,
+  const std::chrono::steady_clock::time_point& end)
+{
+  return std::chrono::duration<double, std::milli>(end - begin).count();
+}
+
+static void dp_profile_print_summary()
+{
+  if (!dp_profile_record.enabled || dp_profile_record.calls == 0) return;
+  const double c = static_cast<double>(dp_profile_record.calls);
+  const double total_ms =
+    dp_profile_record.position_transpose_ms +
+    dp_profile_record.position_d2h_ms +
+    dp_profile_record.type_d2h_ms +
+    dp_profile_record.box_preprocess_ms +
+    dp_profile_record.output_resize_ms +
+    dp_profile_record.deepmd_compute_ms +
+    dp_profile_record.energy_h2d_ms +
+    dp_profile_record.force_h2d_ms +
+    dp_profile_record.virial_h2d_ms +
+    dp_profile_record.output_transpose_ms;
+  printf(
+    "[GPUMD-DP-PROFILE] calls=%lld avg_atoms=%.1f total_ms=%.6f avg_ms=%.6f\n"
+    "[GPUMD-DP-PROFILE] avg_ms position_transpose=%.6f position_d2h=%.6f type_d2h=%.6f box_preprocess=%.6f output_resize=%.6f deepmd_compute=%.6f energy_h2d=%.6f force_h2d=%.6f virial_h2d=%.6f output_transpose=%.6f\n",
+    dp_profile_record.calls,
+    static_cast<double>(dp_profile_record.atoms_accum) / c,
+    total_ms,
+    total_ms / c,
+    dp_profile_record.position_transpose_ms / c,
+    dp_profile_record.position_d2h_ms / c,
+    dp_profile_record.type_d2h_ms / c,
+    dp_profile_record.box_preprocess_ms / c,
+    dp_profile_record.output_resize_ms / c,
+    dp_profile_record.deepmd_compute_ms / c,
+    dp_profile_record.energy_h2d_ms / c,
+    dp_profile_record.force_h2d_ms / c,
+    dp_profile_record.virial_h2d_ms / c,
+    dp_profile_record.output_transpose_ms / c);
+}
+
+  }
 
 DP::DP(const char* filename_dp, int num_atoms)
 {
@@ -103,7 +178,7 @@ void DP::initialize_dp(const char* filename_dp)
 
 DP::~DP(void)
 {
-  // none
+  dp_profile_print_summary();
 }
 
 void DP::set_dp_coeff(void) {
@@ -115,7 +190,6 @@ void DP::set_dp_coeff(void) {
   atom_spin_flag = false;
 }
 
-namespace {
 static __global__ void dp_position_transpose(
   const double* position,
   double* position_trans,
@@ -518,7 +592,6 @@ static __global__ void create_ghost_map(
   }
 }
 
-}
 void DP::compute(
   Box& box,
   const GPU_Vector<int>& type,
@@ -541,18 +614,49 @@ void DP::compute(
   // DeePMD's C++ API only supports box=all-zero (cluster) or box=non-zero (full PBC).
   // We choose the latter and ensure non-periodic directions have sufficient vacuum.
   {
+    const bool profile = dp_profile_enabled();
+    std::chrono::steady_clock::time_point t0;
+    std::chrono::steady_clock::time_point t1;
+    double profile_position_transpose_ms = 0.0;
+    double profile_position_d2h_ms = 0.0;
+    double profile_type_d2h_ms = 0.0;
+    double profile_box_preprocess_ms = 0.0;
+    double profile_output_resize_ms = 0.0;
+    double profile_deepmd_compute_ms = 0.0;
+    double profile_energy_h2d_ms = 0.0;
+    double profile_force_h2d_ms = 0.0;
+    double profile_virial_h2d_ms = 0.0;
+    double profile_output_transpose_ms = 0.0;
+
     // Transpose positions from GPUMD layout (x1..xN, y1..yN, z1..zN) to
     // row-major (x1,y1,z1, x2,y2,z2, ...)
+    if (profile) t0 = std::chrono::steady_clock::now();
     dp_position_gpu_trans.resize(number_of_atoms * 3);
     dp_position_transpose<<<grid_size, BLOCK_SIZE_FORCE>>>(
       position_per_atom.data(), dp_position_gpu_trans.data(), number_of_atoms);
     GPU_CHECK_KERNEL
+    if (profile) {
+      CHECK(gpuDeviceSynchronize());
+      t1 = std::chrono::steady_clock::now();
+      profile_position_transpose_ms = dp_profile_elapsed_ms(t0, t1);
+      t0 = t1;
+    }
     dp_position_cpu.resize(number_of_atoms * 3);
     dp_position_gpu_trans.copy_to_host(dp_position_cpu.data());
+    if (profile) {
+      t1 = std::chrono::steady_clock::now();
+      profile_position_d2h_ms = dp_profile_elapsed_ms(t0, t1);
+      t0 = t1;
+    }
 
     // Copy types to CPU (type is const, so use gpuMemcpy directly)
     type_cpu.resize(number_of_atoms);
     CHECK(gpuMemcpy(type_cpu.data(), type.data(), sizeof(int) * number_of_atoms, gpuMemcpyDeviceToHost));
+    if (profile) {
+      t1 = std::chrono::steady_clock::now();
+      profile_type_d2h_ms = dp_profile_elapsed_ms(t0, t1);
+      t0 = t1;
+    }
 
     // Build the box for DeePMD, handling non-periodic directions.
     // For non-periodic directions, inflate box vectors so that the effective
@@ -706,6 +810,11 @@ void DP::compute(
     dp_box[0] = dp_h[0]; dp_box[1] = dp_h[3]; dp_box[2] = dp_h[6];
     dp_box[3] = dp_h[1]; dp_box[4] = dp_h[4]; dp_box[5] = dp_h[7];
     dp_box[6] = dp_h[2]; dp_box[7] = dp_h[5]; dp_box[8] = dp_h[8];
+    if (profile) {
+      t1 = std::chrono::steady_clock::now();
+      profile_box_preprocess_ms = dp_profile_elapsed_ms(t0, t1);
+      t0 = t1;
+    }
 
     // Allocate output buffers
     dp_ene_all.resize(1, 0.0);
@@ -713,16 +822,42 @@ void DP::compute(
     dp_force.resize(number_of_atoms * 3, 0.0);
     dp_vir_all.resize(9, 0.0);
     dp_vir_atom.resize(number_of_atoms * 9, 0.0);
+    if (profile) {
+      t1 = std::chrono::steady_clock::now();
+      profile_output_resize_ms = dp_profile_elapsed_ms(t0, t1);
+      t0 = t1;
+    }
 
     // Call DeePMD compute WITHOUT neighbor list — DeePMD handles PBC internally
     deep_pot.compute(dp_ene_all, dp_force, dp_vir_all, dp_ene_atom, dp_vir_atom,
                      dp_position_cpu, type_cpu, dp_box);
+    if (profile) {
+      CHECK(gpuDeviceSynchronize());
+      t1 = std::chrono::steady_clock::now();
+      profile_deepmd_compute_ms = dp_profile_elapsed_ms(t0, t1);
+      t0 = t1;
+    }
 
     // Copy results to GPU
     // Memory layout of e_f_v_gpu: e1..eN, fx1,fy1,fz1,...fxN,fyN,fzN, vxx1...
     e_f_v_gpu.copy_from_host(dp_ene_atom.data(), number_of_atoms, 0);
+    if (profile) {
+      t1 = std::chrono::steady_clock::now();
+      profile_energy_h2d_ms = dp_profile_elapsed_ms(t0, t1);
+      t0 = t1;
+    }
     e_f_v_gpu.copy_from_host(dp_force.data(), number_of_atoms * 3, number_of_atoms);
+    if (profile) {
+      t1 = std::chrono::steady_clock::now();
+      profile_force_h2d_ms = dp_profile_elapsed_ms(t0, t1);
+      t0 = t1;
+    }
     e_f_v_gpu.copy_from_host(dp_vir_atom.data(), number_of_atoms * 9, number_of_atoms * 4);
+    if (profile) {
+      t1 = std::chrono::steady_clock::now();
+      profile_virial_h2d_ms = dp_profile_elapsed_ms(t0, t1);
+      t0 = t1;
+    }
 
     // Transpose forces/virials from DeePMD layout to GPUMD layout (no ghost folding)
     transpose_and_update_unit_no_ghost<<<grid_size, BLOCK_SIZE_FORCE>>>(
@@ -735,6 +870,24 @@ void DP::compute(
       virial_unit_cvt_factor,
       number_of_atoms);
     GPU_CHECK_KERNEL
+    if (profile) {
+      CHECK(gpuDeviceSynchronize());
+      t1 = std::chrono::steady_clock::now();
+      profile_output_transpose_ms = dp_profile_elapsed_ms(t0, t1);
+
+      dp_profile_record.calls += 1;
+      dp_profile_record.atoms_accum += number_of_atoms;
+      dp_profile_record.position_transpose_ms += profile_position_transpose_ms;
+      dp_profile_record.position_d2h_ms += profile_position_d2h_ms;
+      dp_profile_record.type_d2h_ms += profile_type_d2h_ms;
+      dp_profile_record.box_preprocess_ms += profile_box_preprocess_ms;
+      dp_profile_record.output_resize_ms += profile_output_resize_ms;
+      dp_profile_record.deepmd_compute_ms += profile_deepmd_compute_ms;
+      dp_profile_record.energy_h2d_ms += profile_energy_h2d_ms;
+      dp_profile_record.force_h2d_ms += profile_force_h2d_ms;
+      dp_profile_record.virial_h2d_ms += profile_virial_h2d_ms;
+      dp_profile_record.output_transpose_ms += profile_output_transpose_ms;
+    }
 
     return;
   }
